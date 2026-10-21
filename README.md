@@ -79,6 +79,22 @@ The output file is saved alongside the input file, with `.spliceai2` appended to
 
 Eight of the 260 columns correspond one-to-one with SpliceAI's outputs: `DS_DG`, `DS_DL`, `DS_AG`, `DS_AL`, `DP_DG`, `DP_DL`, `DP_AG`, and `DP_AL` map to `donor_gain_delta_score_0`, `donor_loss_delta_score_0`, `acceptor_gain_delta_score_0`, `acceptor_loss_delta_score_0`, `donor_gain_dist_0`, `donor_loss_dist_0`, `acceptor_gain_dist_0`, and `acceptor_loss_dist_0`, respectively.
 
+### Saturation mutagenesis
+
+To score all three substitutions at every position of a reference range on one strand, use `spliceai2-saturate` instead of listing the variants in a `tsv` file:
+
+```bash
+spliceai2-saturate \
+    --model_folders /path/to/model_01 /path/to/model_02 \
+    --fasta_file /path/to/reference.fa \
+    --chrom chr1 --start 1000000 --end 1100000 --strand + \
+    --out_file /path/to/saturation.tsv.gz
+```
+
+The output has the same columns as above, with `ref` and `alt` given on the forward strand, and is gzipped if `--out_file` ends in `.gz`. Positions whose reference base is not `A`, `C`, `G`, or `T` are skipped, and the range must have 98,304 nt of flanking sequence on each side within the chromosome.
+
+Scores match those from `spliceai2` up to floating point rounding, at a fraction of the cost. Reference predictions are shared by all variants in a range, and each variant is recomputed only where it can change the network's intermediate features. Reduce `--batch_size` (default 32) or `--chunk_len` (default 16,384) if GPU memory runs out.
+
 ## Transcript prediction
 
 SpliceAI2 can also predict transcripts directly from sequence. For variant analysis, generate predictions separately for the reference and alternate sequences.
