@@ -38,8 +38,14 @@ def main():
     result = torch.cat([p[0] for p in preds]).cpu().numpy()
     col = preds[0][1]
 
+    var_df = format_scores(var_df.drop(columns="assembly"), result, col)
+    var_df.to_csv(
+        f"{args.var_tsv_file}.{args.model_suffix}", sep="\t", index=False
+    )
+
+
+def format_scores(var_df, result, col):
     var_df = var_df.join(pd.DataFrame(result, columns=col))
-    var_df = var_df.drop(columns="assembly")
     var_df["spliceai2_summary_score"] = var_df[[
         "donor_gain_delta_score_0",
         "donor_loss_delta_score_0",
@@ -48,9 +54,7 @@ def main():
     ]].max(axis=1)
     var_df = var_df.round({c: 2 for c in var_df.columns if "score" in c})
     var_df = var_df.astype({c: "int32" for c in var_df.columns if "dist" in c})
-    var_df.to_csv(
-        f"{args.var_tsv_file}.{args.model_suffix}", sep="\t", index=False
-    )
+    return var_df
 
 
 if __name__ == "__main__":

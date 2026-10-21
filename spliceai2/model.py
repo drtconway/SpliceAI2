@@ -46,16 +46,20 @@ class Attention(nn.Module):
         self._num_features = num_features
 
     def forward(self, x, token_idxs):
-        x = x.permute(0, 2, 1)
-        x = self._token_norm(x)
-        x = x.permute(0, 2, 1)
         out = (self._num_features ** -0.5) * torch.einsum(
-            "bcl,bcm->blm",
-            self._rope(self._query(x), token_idxs),
-            self._rope(self._key(x), token_idxs)
+            "bcl,bcm->blm", *self.project(x, token_idxs)
         )
         out -= out.clone().fill_(1e4).tril()
         return out
+
+    def project(self, x, token_idxs):
+        x = x.permute(0, 2, 1)
+        x = self._token_norm(x)
+        x = x.permute(0, 2, 1)
+        return (
+            self._rope(self._query(x), token_idxs),
+            self._rope(self._key(x), token_idxs)
+        )
 
     def _rope(self, x, token_idxs):
         freqs = 1e4 ** -(
@@ -116,21 +120,56 @@ class SpliceAI2(LightningModule):
             )
         return ftrs
 
+    def forward_embed(self, x):
+        return self._embed(x)
+
+    def forward_block(self, b, x):
+        z = self._blocks[b](self._downsamplers[b](x))
+        return z, self._upsamplers[b](z)
+
     def forward_1d(self, ftrs):
         out_ss = 0.0
         for b in range(self._num_blocks):
-            out_ss += (1 / self._num_blocks) * self._ss_heads[b](ftrs[b])
+            out_ss += self.forward_1d_block(b, ftrs[b])
         return out_ss
 
+    def forward_1d_block(self, b, ftr):
+        return (1 / self._num_blocks) * self._ss_heads[b](ftr)
+
     def forward_2d(self, ftrs, y_2d_idxs):
+        return self.forward_2d_gathered(
+            [
+                ftr.gather(
+                    2, y_2d_idxs.unsqueeze(1).repeat(1, ftr.shape[1], 1)
+                )
+                for ftr in ftrs
+            ],
+            y_2d_idxs
+        )
+
+    def forward_2d_gathered(self, ftrs_2d, y_2d_idxs):
         out_jxn = 0.0
         for b in range(self._num_blocks):
             out_jxn += (1 / self._num_blocks) * self._jxn_heads[b](
-                ftrs[b].gather(
-                    2, y_2d_idxs.unsqueeze(1).repeat(1, ftrs[b].shape[1], 1)
-                ),
-                y_2d_idxs
+                ftrs_2d[b], y_2d_idxs
             )
+        return out_jxn
+
+    def forward_2d_fused(self, ftrs_2d, y_2d_idxs):
+        # Same as forward_2d_gathered up to rounding: the per-block scaled
+        # dot products and masks are summed with a single matmul over the
+        # concatenated query and key channels of all blocks
+        query, key = zip(*[
+            self._jxn_heads[b].project(ftrs_2d[b], y_2d_idxs)
+            for b in range(self._num_blocks)
+        ])
+        scale = self.hparams.num_features ** -0.5 / self._num_blocks
+        out_jxn = torch.einsum(
+            "bcl,bcm->blm",
+            scale * torch.cat(query, dim=1),
+            torch.cat(key, dim=1)
+        )
+        out_jxn -= out_jxn.clone().fill_(1e4).tril()
         return out_jxn
 
     def training_step(self, batch):
@@ -287,21 +326,23 @@ class VariantAnnotator(LightningModule):
 
     def predict_step(self, batch):
         x_ref, x_alt, strand, ref_len, alt_len = batch
-        (
+        return self._summarize(*self.forward(
+            x_ref.float(),
+            x_alt.float(),
+            strand.unsqueeze(1),
+            ref_len.unsqueeze(1),
+            alt_len.unsqueeze(1)
+        ))
+
+    def _summarize(
+            self,
             prob_ss_ref,
             prob_ss_alt,
             dist_1d_ref,
             prob_jxn_ref,
             prob_jxn_alt,
             dist_2d_ref
-        ) = self.forward(
-            x_ref.float(),
-            x_alt.float(),
-            strand.unsqueeze(1),
-            ref_len.unsqueeze(1),
-            alt_len.unsqueeze(1)
-        )
-
+    ):
         result, col = zip(
             self._extract_topk(
                 prob_ss_ref, prob_ss_alt, dist_1d_ref, "donor_gain"

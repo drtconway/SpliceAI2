@@ -19,7 +19,10 @@ setup(
         'torch>=2.1',
         'lightning>=2.1'
     ],
-    entry_points={'console_scripts': ['spliceai2=spliceai2.score:main']},
+    entry_points={'console_scripts': [
+        'spliceai2=spliceai2.score:main',
+        'spliceai2-saturate=spliceai2.saturate:main'
+    ]},
     author='Kishore Jaganathan',
     author_email='kjaganathan@illumina.com'
 )
