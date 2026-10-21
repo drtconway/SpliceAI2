@@ -1,10 +1,10 @@
 // Saturation mutagenesis over a list of gene ranges with spliceai2-saturate.
 //
-// Genes are split into tiles, and each tile is scored by one task. Tasks run
-// one at a time because a single task saturates the GPU. Outputs are hard
-// links to the task outputs in the work folder, so -resume works without
-// doubling disk use. Tiles whose output already exists in the output folder
-// are also skipped, with or without -resume.
+// Genes are split into tiles, and each tile is scored by one task on one GPU
+// (see the profiles in nextflow.config). Outputs are hard links to the task
+// outputs in the work folder, so -resume works without doubling disk use.
+// Tiles whose output already exists in the output folder are also skipped,
+// with or without -resume.
 
 params.genes = "${projectDir}/gencode-50-genes.tsv"
 params.fasta = "${System.getProperty('user.home')}/data/hg38/hg38_primary.fa"
@@ -37,7 +37,6 @@ def geneTiles(row, chromLens) {
 
 process SATURATE {
     tag "${name}:${start}-${end}"
-    maxForks 1
     errorStrategy { task.attempt <= (params.max_retries as int) ? 'retry' : 'ignore' }
     publishDir params.outdir, mode: 'link'
 
