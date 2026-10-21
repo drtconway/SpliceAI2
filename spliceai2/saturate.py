@@ -6,16 +6,19 @@ import numpy as np
 import pandas as pd
 import pyfaidx
 import torch
+import torch.nn.functional as F
 from spliceai2.dataset import _one_hot_encode
 from spliceai2.model import SpliceAI2, VariantAnnotator
 from spliceai2.score import format_scores
 
 # Per-block geometry of an SNV patch, in coordinates of the per-variant
-# window: `slice` is the input range recomputed for the block, `dirty` the
-# full-resolution range where alt can differ from ref after the block, and
-# `cells` the pooled range kept for gathering junction features.
+# window at the block's pooled resolution: `patch` is the input range where
+# alt can differ from ref, `slice` the input range recomputed for the block,
+# and `changed` the output range where alt can differ. `dirty` is the
+# full-resolution range where the upsampled output can differ, and `ratio`
+# the pool of the next block relative to this one.
 _BlockGeometry = namedtuple(
-    "_BlockGeometry", ["pool", "slice", "dirty", "cells"]
+    "_BlockGeometry", ["pool", "ratio", "patch", "slice", "changed", "dirty"]
 )
 
 
@@ -25,25 +28,48 @@ def _round_up(x, unit):
 
 def _patch_geometry(model, in_len, var_idx):
     hparams = model.hparams
-    unit = max(hparams.pool[:hparams.num_blocks])
-    dirty = (var_idx, var_idx + 1)
+    pools = hparams.pool[:hparams.num_blocks]
+    unit = max(pools)
+    patch = (var_idx, var_idx + 1)
     geometry = []
-    for b in range(hparams.num_blocks):
-        pool = hparams.pool[b]
+    for b, pool in enumerate(pools):
+        ratio = pools[b + 1] // pool if b + 1 < len(pools) else 1
         half_width = (hparams.kernel_size // 2) * hparams.dilation[b]
-        cell_lo, cell_hi = dirty[0] // pool, -(-dirty[1] // pool)
+        # Slices are aligned to the coarsest pooling grid so that they can
+        # be pooled by every later block, with 4 cells of margin beyond the
+        # outputs that are read
+        align = unit // pool
         slice_ = (
-            (cell_lo - 2 * half_width - 2) * pool // unit * unit,
-            _round_up((cell_hi + 2 * half_width + 2) * pool, unit)
+            (patch[0] - 2 * half_width - 4) // align * align,
+            _round_up(patch[1] + 2 * half_width + 4, align)
         )
-        assert slice_[0] >= 0 and slice_[1] <= in_len
+        assert slice_[0] >= 0 and slice_[1] <= in_len // pool
+        changed = (patch[0] - half_width, patch[1] + half_width)
         dirty = (
-            (cell_lo - half_width - 1) * pool,
-            (cell_hi + half_width + 1) * pool
+            max((changed[0] - 1) * pool, 0),
+            min((changed[1] + 1) * pool, in_len)
         )
-        cells = (cell_lo - half_width - 2, cell_hi + half_width + 2)
-        geometry.append(_BlockGeometry(pool, slice_, dirty, cells))
+        geometry.append(
+            _BlockGeometry(pool, ratio, patch, slice_, changed, dirty)
+        )
+        # Next block input cell c reads output cells
+        # [c * ratio - ext, (c + 1) * ratio + ext) of this block
+        ext = 0 if pool == 1 else 1
+        patch = (
+            (changed[0] - ext) // ratio, -(-(changed[1] + ext) // ratio)
+        )
     return geometry
+
+
+def _pool_upsampled(z, pool, ratio):
+    # Matches nn.AvgPool1d(pool * ratio)(nn.Upsample(scale_factor=pool,
+    # mode="linear")(z)) without materializing the upsampled sequence:
+    # averaging a linear upsample over each cell is a fixed 3-tap filter
+    z = z.float()
+    if pool > 1:
+        z = F.pad(z, (1, 1), mode="replicate")
+        z = z[..., :-2] / 8 + z[..., 1:-1] * 0.75 + z[..., 2:] / 8
+    return F.avg_pool1d(z, ratio) if ratio > 1 else z
 
 
 def _slice_windows(x, starts, length):
@@ -95,37 +121,30 @@ class SaturationAnnotator(VariantAnnotator):
         }
 
     def forward_ref(self, x, offsets, strand):
-        geometry = self._geometry[strand]
-        out_hi = self._out_lo + self._out_1d_len
-        extents = []
-        for t in range(self._num_blocks + 1):
-            bounds = []
-            if t < self._num_blocks:
-                bounds.append(geometry[t].slice)
-            if t > 0:
-                bounds.append((self._out_lo, out_hi))
-            extents.append((
-                min(offsets) + min(lo for lo, _ in bounds),
-                max(offsets) + max(hi for _, hi in bounds)
-            ))
+        # Block inputs and outputs are kept at each block's pooled
+        # resolution; the full-resolution stream is never materialized.
+        # Splice site heads are pointwise, so they are applied before
+        # upsampling.
         logits_lo = min(offsets) + self._out_lo
-        logits_hi = max(offsets) + out_hi
+        logits_hi = max(offsets) + self._out_lo + self._out_1d_len
+        pos = torch.arange(logits_lo, logits_hi, device=x.device)[None]
 
         states = []
         for model in self._models:
-            stream, logits = [], []
-            ftr = model.forward_embed(x)
-            for t, (lo, hi) in enumerate(extents):
-                if t > 0:
-                    _, ftr = model.forward_block(t - 1, ftr)
-                    logits.append(model.forward_1d_block(
-                        t - 1, ftr[..., logits_lo:logits_hi]
-                    )[0].float())
-                stream.append(ftr[0, :, lo:hi].clone())
+            inputs, outputs, logits = [], [], []
+            u = model.forward_embed(x).float()
+            for b, geom in enumerate(self._geometry[strand]):
+                z = model._blocks[b](u)
+                inputs.append(u[0])
+                outputs.append(z[0])
+                logits.append(_gather_upsampled(
+                    model.forward_1d_block(b, z), 0, geom.pool, pos
+                )[0])
+                u = _pool_upsampled(z, geom.pool, geom.ratio)
             logits = torch.stack(logits)
             states.append({
-                "stream": stream,
-                "stream_lo": [lo for lo, _ in extents],
+                "inputs": inputs,
+                "outputs": outputs,
                 "logits": logits,
                 "logits_sum": logits.sum(dim=0),
                 "logits_lo": logits_lo
@@ -134,12 +153,10 @@ class SaturationAnnotator(VariantAnnotator):
 
     def forward(self, states, offsets, x_alt, strand):
         geometry = self._geometry[strand]
-        var_idx = self._in_len // 2 - (strand == -1)
         out_lo, out_len = self._out_lo, self._out_1d_len
 
         prob_ss_ref, prob_ss_alt, z_alt = [], [], []
         for model, state in zip(self._models, states):
-            stream, stream_lo = state["stream"], state["stream_lo"]
             logits, logits_lo = state["logits"], state["logits_lo"]
             out_ss_ref = _slice_windows(
                 state["logits_sum"],
@@ -147,40 +164,46 @@ class SaturationAnnotator(VariantAnnotator):
                 out_len
             )
             out_ss_alt = out_ss_ref.clone()
-            patch = model.forward_embed(x_alt)
-            dirty = (var_idx, var_idx + 1)
+            patch = model.forward_embed(x_alt).float()
             z_alt.append([])
             for b, geom in enumerate(geometry):
                 slice_lo, slice_hi = geom.slice
-                ftr = _slice_windows(
-                    stream[b],
-                    [o + slice_lo - stream_lo[b] for o in offsets],
+                u = _slice_windows(
+                    state["inputs"][b],
+                    [o // geom.pool + slice_lo for o in offsets],
                     slice_hi - slice_lo
                 )
-                ftr[..., dirty[0] - slice_lo:dirty[1] - slice_lo] = patch
-                z, ftr = model.forward_block(b, ftr)
-                dirty = geom.dirty
-                patch = ftr[..., dirty[0] - slice_lo:dirty[1] - slice_lo]
-                z_alt[-1].append(z[
-                    ...,
-                    geom.cells[0] - slice_lo // geom.pool:
-                    geom.cells[1] - slice_lo // geom.pool
-                ])
+                u[..., geom.patch[0] - slice_lo:geom.patch[1] - slice_lo] = (
+                    patch
+                )
+                z = model._blocks[b](u)
+                z_alt[-1].append(z)
 
-                head_lo = max(dirty[0], out_lo)
-                head_hi = min(dirty[1], out_lo + out_len)
+                head_lo = max(geom.dirty[0], out_lo)
+                head_hi = min(geom.dirty[1], out_lo + out_len)
                 if head_lo < head_hi:
+                    pos = torch.arange(
+                        head_lo, head_hi, device=z.device
+                    ).expand(len(offsets), -1)
                     out_ss_alt[..., head_lo - out_lo:head_hi - out_lo] += (
-                        model.forward_1d_block(
-                            b,
-                            patch[..., head_lo - dirty[0]:head_hi - dirty[0]]
-                        ).float()
+                        _gather_upsampled(
+                            model.forward_1d_block(b, z),
+                            slice_lo,
+                            geom.pool,
+                            pos
+                        )
                         - _slice_windows(
                             logits[b],
                             [o + head_lo - logits_lo for o in offsets],
                             head_hi - head_lo
                         )
                     )
+                if b + 1 < len(geometry):
+                    next_lo, next_hi = geometry[b + 1].patch
+                    pooled_lo = slice_lo // geom.ratio
+                    patch = _pool_upsampled(z, geom.pool, geom.ratio)[
+                        ..., next_lo - pooled_lo:next_hi - pooled_lo
+                    ]
             prob_ss_ref.append(out_ss_ref.sigmoid())
             prob_ss_alt.append(out_ss_alt.sigmoid())
         prob_ss_ref = torch.stack(prob_ss_ref).mean(dim=0).float()
@@ -205,17 +228,20 @@ class SaturationAnnotator(VariantAnnotator):
         for model, state, z_alt_model in zip(self._models, states, z_alt):
             ftrs_ref, ftrs_alt = [], []
             for b, geom in enumerate(geometry):
-                ftr_ref = state["stream"][b + 1][
-                    :, offsets + win_pos - state["stream_lo"][b + 1]
-                ].transpose(0, 1)
+                ftr_ref = _gather_upsampled(
+                    state["outputs"][b].expand(len(offsets), -1, -1),
+                    0,
+                    geom.pool,
+                    offsets + win_pos
+                )
                 in_patch = (
                     (win_pos >= geom.dirty[0]) & (win_pos < geom.dirty[1])
                 )
                 ftr_alt = torch.where(
                     in_patch.unsqueeze(1),
                     _gather_upsampled(
-                        z_alt_model[b], geom.cells[0], geom.pool, win_pos
-                    ).to(ftr_ref.dtype),
+                        z_alt_model[b], geom.slice[0], geom.pool, win_pos
+                    ),
                     ftr_ref
                 )
                 ftrs_ref.append(ftr_ref)
@@ -325,21 +351,24 @@ class SaturationAnnotator(VariantAnnotator):
                 ]
                 for i in range(0, len(variants), batch_size):
                     batch = variants[i:i + batch_size]
+                    # Short batches are padded so that compiled code sees a
+                    # single batch size
+                    padded = batch + batch[-1:] * (batch_size - len(batch))
                     x_alt = np.stack([
                         _one_hot_encode(alt, assembly)
-                        for _, _, alt, _ in batch
+                        for _, _, alt, _ in padded
                     ])
                     if strand_sign == -1:
                         x_alt[:, :4] = x_alt[:, :4][:, ::-1]
                     result, col = self.predict_step((
                         states,
-                        [offset for _, _, _, offset in batch],
+                        [offset for _, _, _, offset in padded],
                         torch.tensor(
                             x_alt, dtype=torch.float32, device=self.device
                         ),
                         strand_sign
                     ))
-                    results.append(result.float().cpu())
+                    results.append(result[:len(batch)].float().cpu())
                     rows += [
                         (chrom, pos, ref, alt, strand)
                         for pos, ref, alt, _ in batch
@@ -366,6 +395,7 @@ def main():
     parser.add_argument("--out_2d_len", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--chunk_len", type=int, default=16384)
+    parser.add_argument("--no_compile", action="store_true")
     args = parser.parse_args()
 
     print(args.model_folders)
@@ -376,6 +406,13 @@ def main():
         )
         for model_folder in args.model_folders
     ]
+    if not args.no_compile:
+        # Only the junction heads are compiled: their inputs have a fixed
+        # shape, unlike the per-block patches
+        for model in models:
+            model.forward_2d_fused = torch.compile(
+                model.forward_2d_fused, dynamic=False
+            )
     annotator = SaturationAnnotator(models, args.in_len, args.out_2d_len)
     annotator = annotator.to(device).eval()
     fasta = pyfaidx.Fasta(args.fasta_file)

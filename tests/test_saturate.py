@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from spliceai2.dataset import VariantDataset, _one_hot_encode
 from spliceai2.model import SpliceAI2, VariantAnnotator
 from spliceai2.saturate import (
-    SaturationAnnotator, _gather_upsampled, _patch_geometry
+    SaturationAnnotator, _gather_upsampled, _patch_geometry, _pool_upsampled
 )
 
 IN_LEN = 196608
@@ -65,6 +65,15 @@ def test_gather_upsampled(pool):
     )
 
 
+@pytest.mark.parametrize("pool,ratio", [(1, 1), (1, 2), (2, 1), (2, 2), (16, 1)])
+def test_pool_upsampled(pool, ratio):
+    z = torch.randn(2, 3, 40)
+    up = nn.Upsample(scale_factor=pool, mode="linear")(z)
+    torch.testing.assert_close(
+        _pool_upsampled(z, pool, ratio), nn.AvgPool1d(pool * ratio)(up)
+    )
+
+
 def test_forward_2d_fused():
     model = _random_model(0)
     ftrs_2d = [torch.randn(2, 8, 64) for _ in range(20)]
@@ -88,12 +97,19 @@ def test_patch_geometry_covers_alt_changes(var_idx):
         ftr_ref = model.forward_embed(x_ref)
         ftr_alt = model.forward_embed(x_alt)
         for b, geom in enumerate(_patch_geometry(model, IN_LEN, var_idx)):
-            _, ftr_ref = model.forward_block(b, ftr_ref)
-            _, ftr_alt = model.forward_block(b, ftr_alt)
-            changed = (ftr_alt != ftr_ref).any(dim=1)[0].nonzero()
-            assert len(changed) > 0
-            assert geom.dirty[0] <= changed.min()
-            assert changed.max() < geom.dirty[1]
+            u_ref = model._downsamplers[b](ftr_ref)
+            u_alt = model._downsamplers[b](ftr_alt)
+            z_ref, ftr_ref = model.forward_block(b, ftr_ref)
+            z_alt, ftr_alt = model.forward_block(b, ftr_alt)
+            for ref, alt, (lo, hi) in [
+                (u_ref, u_alt, geom.patch),
+                (z_ref, z_alt, geom.changed),
+                (ftr_ref, ftr_alt, geom.dirty)
+            ]:
+                changed = (alt != ref).any(dim=1)[0].nonzero()
+                assert len(changed) > 0
+                assert lo <= changed.min()
+                assert changed.max() < hi
 
 
 @pytest.mark.parametrize("strand", ["+", "-"])

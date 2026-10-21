@@ -1,2 +1,6 @@
 .venv/
 *.egg-info/
+work/
+.nextflow/
+.nextflow.log*
+outputs/
